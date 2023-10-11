@@ -17,6 +17,7 @@ AUTO_RUN_INPUT = "AutoRun"
 CLIENT_TICK_RATE_INPUT = "ClientTickRateInput"
 CLIENT_JITTER_COMP_INPUT = "ClientJitterCompInput"
 TRACK_INPUT = "TrackInput"
+UPDATE_TIMEOUT = 5
 
 def initialize(rhapi):
     logging.info("--------------INITIALIZE FLOW STATE--------------")
@@ -53,6 +54,7 @@ class FSManager():
         self.rhapi.ui.socket_listen("fs_set_state", self.setPlayerState)
         self.rhapi.ui.socket_listen("fs_get_settings", self.setClientSettings)
         self.rhapi.ui.socket_listen("fs_player_join", self.handlePlayerJoin)
+        self.rhapi.ui.socket_listen("fs_spectate", self.handleSpectate)
 
         #main game state that will be distributed to all players as well as updated by them
         blankState = {"seat": -1, "position":[0,0,0], "orientation":[0,0,0], "rssi":0}
@@ -60,7 +62,7 @@ class FSManager():
         blankMeta = {"lastUpdateTime":0.0}
         self.flowStateMeta = [blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta]
 
-        self.seatTimeout = [0,0,0,0,0,0,0,0]
+        self.seatLastMessageTimes = [0,0,0,0,0,0,0,0]
 
         #load our server settings or fallback to default value
         logging.info("Flowstate: Loading server settings")
@@ -94,43 +96,91 @@ class FSManager():
 
         self.lastTick = time.time()
 
-    #def stateHandler(self, data):
-    #    logging.info("Flowstate got a sim lap!")
-    #    logging.info(str(data))
-
-    def handleDiscardLaps(self):
-        logging.info("handling stage_race")
-        
-
     def handleAutoRun(self):
         if(self.rhapi.db.option(AUTO_RUN_INPUT)=="1"):
+            #if the race is in the stopped state
             if(self.rhapi.race.status==2):
+                #if a heat hasn't been scheduled yet
                 if(self.rhapi.race.scheduled==None):
-                    logging.info("race status: "+str(self.rhapi.race.status))
-                    self.rhapi.race.clear()
+                    #save the laps and schedule the next heat
+                    self.rhapi.race.save()
                     self.rhapi.race.schedule(11)
+
+    def getConnectedSeats(self):
+        connectedSeats = []
+        for i in range(0,len(self.flowStateMeta)):
+            sto = self.seatLastMessageTimes[i]
+            
+            if(time.time()-sto<UPDATE_TIMEOUT):
+                connectedSeats.append(True)
+            else:
+                connectedSeats.append(False)
+        return connectedSeats
+
+    def handleEarlyFinish(self):
+        #if the race is currently running
+        if(self.rhapi.race.status==1):
+            seatsFinished = self.rhapi.race.seats_finished
+            seatsConnected = self.getConnectedSeats()
+
+            #check if all the connected pilots are done
+            readyToRestart = True
+            for i in range(0,len(seatsConnected)):
+                connected = seatsConnected[i]
+                if(i in seatsFinished):
+                    finished = seatsFinished[i]
+                    if((connected) and (not finished)):
+                        readyToRestart = False
+                        break
+            #if so...
+            if(readyToRestart):
+                #stop the race early
+                self.rhapi.race.stop()
 
     def findOpenSeat(self):
         logging.info("findOpenSeat")
         openSeat = 0
 
         a = []
+        found = False
         for i in range(0,len(self.flowStateMeta)):
-            sto = self.seatTimeout[i]
+            sto = self.seatLastMessageTimes[i]
             a.append(time.time()-sto)
-            if(time.time()-sto>10):
+            if(time.time()-sto>UPDATE_TIMEOUT):
                 openSeat = i
-        logging.info(str(a))
-        logging.info("found open seat: "+str(openSeat))
+                found = True
+                break
+        if(found):
+            logging.info("found open seat: "+str(openSeat))
+        else:
+            logging.info("no open seats available")
+            openSeat = -1
         return openSeat
 
     def handlePlayerJoin(self):
         logging.info("handlePlayerJoin")
+        logging.info("seats already connected...")
+        logging.info(str(self.getConnectedSeats()))
         seat = self.findOpenSeat()
         self.rhapi.ui.socket_send("fs_set_seat", {"seat":seat})
 
+    def handleSpectate(self):
+        #if we are updating clients asynchronously
+        if(self.asyncState):
+            #echo the flow state
+            self.rhapi.ui.socket_send("fs", self.flowState)
+        else: #otherwise
+            #check if it's time to send a new update
+            elapsed = time.time()-self.lastTick
+            if(elapsed>(1.0/self.serverTickRate)):
+                #update all the clients
+                self.rhapi.ui.socket_broadcast("fs", self.flowState)
+                self.lastTick = time.time()
+                #logging.info(self.flowState["time"])
+
     def setPlayerState(self, data):
         self.handleAutoRun()
+        self.handleEarlyFinish()
         #logging.info(str(data))
         seat = data["seat"]
         rssi = data["rssi"]
@@ -138,7 +188,7 @@ class FSManager():
         #let's keep track of when this player was last updated
         self.flowStateMeta[seat]["lastUpdateTime"] = time.time()
 
-        self.seatTimeout[seat] = time.time()
+        self.seatLastMessageTimes[seat] = time.time()
 
         self.setRSSI(seat, rssi)
         self.flowState["states"][seat] = data
