@@ -6,28 +6,29 @@ from eventmanager import Evt
 import Config
 from RHUI import UIField, UIFieldType, UIFieldSelectOption
 import struct
-import time
+from time import monotonic
+import gevent.monkey
+gevent.monkey.patch_all()
 
 logger = logging.getLogger(__name__)
 
 PANEL_NAME = "FlowStatePanel"
 SERVER_TICK_RATE_INPUT = "ServerTickRateInput"
-ASYNC_STATE_INPUT = "AsyncStateInput"
 AUTO_RUN_INPUT = "AutoRun"
 CLIENT_TICK_RATE_INPUT = "ClientTickRateInput"
 CLIENT_JITTER_COMP_INPUT = "ClientJitterCompInput"
 TRACK_INPUT = "TrackInput"
+APPLY_INPUT = "ApplyInput"
+STEAM_ID = "SteamID"
 UPDATE_TIMEOUT = 5
+MAX_PLAYERS = 8
 
 def initialize(rhapi):
     logging.info("--------------INITIALIZE FLOW STATE--------------")
     RH = FSManager(rhapi)
     rhapi.ui.register_panel(PANEL_NAME, 'FlowState', 'run', order=0)
 
-    serverTickRateField = UIField(name = SERVER_TICK_RATE_INPUT, label = 'Server Tick Rate', field_type = UIFieldType.BASIC_INT, value = 15)
-    rhapi.fields.register_option(serverTickRateField, PANEL_NAME)
-
-    clientTickRateField = UIField(name = CLIENT_TICK_RATE_INPUT, label = 'Client Tick Rate (ignored if Async State is enabled)', field_type = UIFieldType.BASIC_INT, value = 20)
+    clientTickRateField = UIField(name = CLIENT_TICK_RATE_INPUT, label = 'Client Tick Rate', field_type = UIFieldType.BASIC_INT, value = 20)
     rhapi.fields.register_option(clientTickRateField, PANEL_NAME)
 
     jitterCompField = UIField(name = CLIENT_JITTER_COMP_INPUT, label = 'Client Smoothing (0-100)', field_type = UIFieldType.BASIC_INT, value = 50)
@@ -36,32 +37,35 @@ def initialize(rhapi):
     trackField = UIField(name = TRACK_INPUT, label = 'Track', field_type = UIFieldType.TEXT, value = "The Shrine")
     rhapi.fields.register_option(trackField, PANEL_NAME)
 
-    asyncStateField = UIField(name = ASYNC_STATE_INPUT, label = 'Async State', field_type = UIFieldType.CHECKBOX, value = "1")
-    rhapi.fields.register_option(asyncStateField, PANEL_NAME)
-
     autRun = UIField(name = AUTO_RUN_INPUT, label = 'Auto Run Next Heat', field_type = UIFieldType.CHECKBOX, value = "0")
     rhapi.fields.register_option(autRun, PANEL_NAME)
 
-    rhapi.ui.register_quickbutton(PANEL_NAME, 'apply', 'Apply', RH.apply)
+    rhapi.ui.register_quickbutton(PANEL_NAME, APPLY_INPUT, 'Apply', RH.apply)
+
+    #data attributes
+    pilotSteamID = UIField(name = STEAM_ID, label = "Steam ID", field_type = UIFieldType.TEXT)
+    rhapi.fields.register_pilot_attribute(pilotSteamID)
     
     logging.info("--------------FLOW STATE INITIALIZED--------------")
 
 class FSManager():
     def __init__(self, rhapi):
         self.rhapi = rhapi
-
+        self.maxPlayerCount = MAX_PLAYERS
+        
         #websocket listeners
         self.rhapi.ui.socket_listen("fs_set_state", self.setPlayerState)
         self.rhapi.ui.socket_listen("fs_get_settings", self.setClientSettings)
         self.rhapi.ui.socket_listen("fs_player_join", self.handlePlayerJoin)
         self.rhapi.ui.socket_listen("fs_spectate", self.handleSpectate)
+        self.rhapi.ui.socket_listen("fs_add_lap", self.handleNewLap)
 
         #main game state that will be distributed to all players as well as updated by them
-        blankState = {"seat": -1, "position":[0,0,0], "orientation":[0,0,0], "rssi":0}
-        self.flowState = {"time":0.0,"states":[blankState,blankState,blankState,blankState,blankState,blankState,blankState,blankState]}
+        self.blankState = {"seat": -1, "position":[0,-100,0], "orientation":[0,0,0], "rssi":0}
+        self.flowState = {"time":0.0,"states":[self.blankState]*self.maxPlayerCount}
         blankMeta = {"lastUpdateTime":0.0}
-        self.flowStateMeta = [blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta,blankMeta]
-
+        self.flowStateMeta = [blankMeta]*self.maxPlayerCount
+        self.cachedLaps = [[[]]]*self.maxPlayerCount
         self.seatLastMessageTimes = [0,0,0,0,0,0,0,0]
 
         #load our server settings or fallback to default value
@@ -69,7 +73,6 @@ class FSManager():
         serverTickRate = self.rhapi.db.option(SERVER_TICK_RATE_INPUT)
         clientTickRate = self.rhapi.db.option(CLIENT_TICK_RATE_INPUT)
         clientJitterCompensation = self.rhapi.db.option(CLIENT_JITTER_COMP_INPUT)
-        asyncState = self.rhapi.db.option(ASYNC_STATE_INPUT)
         track = self.rhapi.db.option(TRACK_INPUT)
         if(serverTickRate==None):
             logging.info("Flowstate: loading default server tick rate")
@@ -80,21 +83,17 @@ class FSManager():
         if(clientJitterCompensation==None):
             logging.info("Flowstate: loading default client smoothing")
             clientJitterCompensation = 75
-        if(asyncState==None):
-            logging.info("Flowstate: loading default async state")
-            asyncState = "1"
         if(track==None):
-            logging.info("Flowstate: loading default async state")
+            logging.info("Flowstate: loading default track state")
             track = "The Shrine"
 
         logging.info("Flowstate: fs object")
         self.serverTickRate = int(serverTickRate)
         self.clientTickRate = int(clientTickRate)
         self.clientJitterCompensation = int(clientJitterCompensation)
-        self.asyncState = bool(int(asyncState))
         self.track = track
 
-        self.lastTick = time.time()
+        self.lastTick = monotonic()
 
     def handleAutoRun(self):
         if(self.rhapi.db.option(AUTO_RUN_INPUT)=="1"):
@@ -106,22 +105,44 @@ class FSManager():
                     self.rhapi.race.save()
                     self.rhapi.race.schedule(11)
 
+    def handleNewLap(self,data):
+        seat = data["seat"]
+        time = data["time"]
+        #self.cachedLaps[seat].append(time)
+        gevent.spawn(self.addLapInFuture, seat, time)
+        #self.addLap(seat,time)
+
+    def addLapInFuture(self, node, time):
+        while True:
+            if(monotonic()>=time):
+                self.addLap(node, time)
+                logging.info("time: "+str(time))
+                break
+                
+            gevent.sleep()
+
+    def addLap(self, node, time):
+        addTime = monotonic()
+        self.rhapi.interface.simulate_lap({"node":node})
+        logging.info("Lap was added "+str(addTime-time)+"ms late")
+
     def getConnectedSeats(self):
         connectedSeats = []
         for i in range(0,len(self.flowStateMeta)):
             sto = self.seatLastMessageTimes[i]
             
-            if(time.time()-sto<UPDATE_TIMEOUT):
+            if(monotonic()-sto<UPDATE_TIMEOUT):
                 connectedSeats.append(True)
             else:
                 connectedSeats.append(False)
+                self.flowState['states'][i] = self.blankState
         return connectedSeats
 
     def handleEarlyFinish(self):
+        seatsConnected = self.getConnectedSeats()
         #if the race is currently running
         if(self.rhapi.race.status==1):
             seatsFinished = self.rhapi.race.seats_finished
-            seatsConnected = self.getConnectedSeats()
 
             #check if all the connected pilots are done
             readyToRestart = True
@@ -145,8 +166,8 @@ class FSManager():
         found = False
         for i in range(0,len(self.flowStateMeta)):
             sto = self.seatLastMessageTimes[i]
-            a.append(time.time()-sto)
-            if(time.time()-sto>UPDATE_TIMEOUT):
+            a.append(monotonic()-sto)
+            if(monotonic()-sto>UPDATE_TIMEOUT):
                 openSeat = i
                 found = True
                 break
@@ -157,55 +178,59 @@ class FSManager():
             openSeat = -1
         return openSeat
 
-    def handlePlayerJoin(self):
+    def handlePlayerJoin(self, data):
         logging.info("handlePlayerJoin")
         logging.info("seats already connected...")
         logging.info(str(self.getConnectedSeats()))
+        logging.info("searching for pilot...")
+        foundPilotsWithSteamID = self.rhapi.db.pilot_ids_by_attribute(STEAM_ID,data["steamId"])
+        foundPilot = None
+        if(len(foundPilotsWithSteamID)>0):
+            logging.info("found matching pilot! "+str(foundPilotsWithSteamID))
+            for pilot in foundPilotsWithSteamID:
+                if(pilot!=None):
+                    foundPilot = self.rhapi.db.pilot_by_id(pilot)
+                    if(foundPilot!=None):
+                        logging.info("Callsign: "+str(foundPilot.callsign))
+                        foundPilot.callsign = data["steamName"]
+                        break
+        if(foundPilot==None):
+            logging.info("creating new pilot "+str(data["steamName"]))
+            foundPilot = self.rhapi.db.pilot_add(name=data["steamName"], callsign=data["steamName"], phonetic=None, team=None, color=None)
+            logging.info(str(foundPilot.id))
+            self.rhapi.db.pilot_alter(pilot_id=foundPilot.id, attributes={STEAM_ID:data["steamId"]})
         seat = self.findOpenSeat()
-        self.rhapi.ui.socket_send("fs_set_seat", {"seat":seat})
+        self.rhapi.ui.socket_send("fs_join_success", {"id":foundPilot.id, "seat":seat})
+        logging.info("done")
 
     def handleSpectate(self):
-        #if we are updating clients asynchronously
-        if(self.asyncState):
-            #echo the flow state
-            self.rhapi.ui.socket_send("fs", self.flowState)
-        else: #otherwise
-            #check if it's time to send a new update
-            elapsed = time.time()-self.lastTick
-            if(elapsed>(1.0/self.serverTickRate)):
-                #update all the clients
-                self.rhapi.ui.socket_broadcast("fs", self.flowState)
-                self.lastTick = time.time()
-                #logging.info(self.flowState["time"])
+        #echo the flow state
+        self.rhapi.ui.socket_send("fs", self.flowState)
 
     def setPlayerState(self, data):
-        self.handleAutoRun()
-        self.handleEarlyFinish()
+        stateArrivalTime = monotonic()
+        
         #logging.info(str(data))
         seat = data["seat"]
         rssi = data["rssi"]
 
-        #let's keep track of when this player was last updated
-        self.flowStateMeta[seat]["lastUpdateTime"] = time.time()
+        #update state
+        self.flowState["states"][seat] = data
 
-        self.seatLastMessageTimes[seat] = time.time()
+        #echo the flow state
+        self.flowState["time"] = monotonic()
+        self.rhapi.ui.socket_send("fs", self.flowState)
 
         self.setRSSI(seat, rssi)
-        self.flowState["states"][seat] = data
-        self.flowState["time"] = time.time()
-        
-        #if we are updating clients asynchronously
-        if(self.asyncState):
-            #echo the flow state
-            self.rhapi.ui.socket_send("fs", self.flowState)
-        else: #otherwise
-            #check if it's time to send a new update
-            elapsed = time.time()-self.lastTick
-            if(elapsed>(1.0/self.serverTickRate)):
-                #update all the clients
-                self.rhapi.ui.socket_broadcast("fs", self.flowState)
-                self.lastTick = time.time()
-                #logging.info(self.flowState["time"])
+
+        self.seatLastMessageTimes[seat] = stateArrivalTime
+
+        #let's keep track of when this player was last updated
+        self.flowStateMeta[seat]["lastUpdateTime"] = stateArrivalTime
+
+        #handle tasks that need to run every time we get a client update
+        self.handleAutoRun()
+        self.handleEarlyFinish()
         
     def setRSSI(self, seat, value):
         interface = self.rhapi.interface
@@ -214,7 +239,8 @@ class FSManager():
     
     def setClientSettings(self):
         logging.info("setClientSettings")
-        serverSettings = {"track":self.track, "serverTickRate": self.serverTickRate, "clientTickRate": self.clientTickRate, "jitterDampening": (100.0-float(self.clientJitterCompensation))/100.0, "asyncState": bool(int(self.asyncState))}
+        #TO-DO get rid of async state
+        serverSettings = {"track":self.track, "serverTickRate": self.serverTickRate, "clientTickRate": self.clientTickRate, "jitterDampening": (100.0-float(self.clientJitterCompensation))/100.0, "asyncState": True}
         self.rhapi.ui.socket_broadcast("fs_server_settings", serverSettings)
 
     def apply(self, args):
@@ -223,22 +249,7 @@ class FSManager():
         nodes = interface.seats
         self.serverTickRate = int(self.rhapi.db.option(SERVER_TICK_RATE_INPUT))
         self.clientTickRate = int(self.rhapi.db.option(CLIENT_TICK_RATE_INPUT))
-        self.asyncState = self.rhapi.db.option(ASYNC_STATE_INPUT)
         self.clientJitterCompensation = int(self.rhapi.db.option(CLIENT_JITTER_COMP_INPUT))
         self.track = self.rhapi.db.option(TRACK_INPUT)
         self.setClientSettings()
 
-    def packData(self, data):
-        # Your list of floating-point numbers
-        
-
-        # Flatten the list into a single list of floats
-        flat_data = [num for row in data for num in row]
-
-        # Pack the floats as binary data (assuming little-endian encoding)
-        binary_data = struct.pack('<{}f'.format(len(flat_data)), *flat_data)
-
-        # Convert the binary data to an integer
-        encoded_integer = int.from_bytes(binary_data, byteorder='big')  # You can use 'little' if you prefer little-endian encoding
-
-        return encoded_integer
