@@ -159,7 +159,7 @@ class FSManager():
             if(self.rhapi.race.status==2):
                 #if a heat hasn't been scheduled yet
                 if(self.rhapi.race.scheduled==None):
-                    logging.info("bulding next heat")
+                    logging.info("building next heat")
 
                     #get the current heat
                     currentHeat = self.rhapi.db.heat_by_id(self.rhapi.race.heat)
@@ -418,7 +418,7 @@ class FSManager():
         #let's keep track of when this player was last updated
         #self.spectatorMeta[seat]["lastUpdateTime"] = self.flowState["time"]
 
-        self.handleAutoRun()
+        #self.handleAutoRun()
 
     def setPlayerState(self, data):
         stateArrivalTime = monotonic()
@@ -438,8 +438,11 @@ class FSManager():
 
         #let's keep track of when this player was last updated
         self.flowStateMeta[seat]["lastUpdateTime"] = stateArrivalTime
-        steamID = self.rhapi.db.pilot_attribute_value(data["pilotId"], STEAM_ID, default_value=None)
-        self.flowStateMeta[seat]["steamId"] = steamID
+        try:
+            steamID = self.rhapi.db.pilot_attribute_value(data["pilotId"], STEAM_ID, default_value=None)
+            self.flowStateMeta[seat]["steamId"] = steamID
+        except:
+            logging.info("unknown pilot is attempting to update a player's steam ID")
 
         #handle tasks that need to run every time we get a client update
         self.handleAutoRun()
