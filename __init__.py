@@ -159,6 +159,8 @@ class FSManager():
             if(self.rhapi.race.status==2):
                 #if a heat hasn't been scheduled yet
                 if(self.rhapi.race.scheduled==None):
+                    logging.info("bulding next heat")
+
                     #get the current heat
                     currentHeat = self.rhapi.db.heat_by_id(self.rhapi.race.heat)
 
@@ -177,18 +179,27 @@ class FSManager():
       
                     #iterate over our connected pilots
                     logging.info(str(self.flowStateMeta))
+                    connectedSeats = self.getConnectedSeats()
+                    logging.info("connected seats: "+str(connectedSeats))
                     for seat in range(0,len(self.flowStateMeta)):
-                        
-                        #find pilot id via steam id
-                        meta = self.flowStateMeta[seat]
-                        steamID = meta["steamId"]
-                        if(steamID!=""):
-                            pilotsWithSteamID = self.rhapi.db.pilot_ids_by_attribute(STEAM_ID,steamID)
+                        connected = connectedSeats[seat]
 
-                            #found a pilot with a steam ID
-                            if(len(pilotsWithSteamID)>0):
-                                pilotID = pilotsWithSteamID[0]
-                                self.addPilotToCurrentHeat(pilotID)
+                        #if this pilot appears to be connected to the server
+                        if(connected):
+                            #find pilot id via steam id
+                            meta = self.flowStateMeta[seat]
+                            steamID = meta["steamId"]
+
+                            #if they have a valid steam ID
+                            if(steamID!=""):
+                                #add the pilot to the new heat
+                                pilotsWithSteamID = self.rhapi.db.pilot_ids_by_attribute(STEAM_ID,steamID)
+
+                                #found a pilot with a steam ID
+                                if(len(pilotsWithSteamID)>0):
+                                    pilotID = pilotsWithSteamID[0]
+                                    logging.info("adding pilot "+str(pilotID))
+                                    self.addPilotToCurrentHeat(pilotID)
 
                     #schedule the next heat
                     self.rhapi.race.schedule(self.getOption(RACE_COOLDOWN_TIME_INPUT))
@@ -224,13 +235,19 @@ class FSManager():
         logging.info("Lap was added "+str((addTime-time)*1000)+"ms late")
 
     def handleSeatRequest(self, data):
-        logging.info("pilot "+str(data['pilotId'])+" requested to be join the current heat")
-        self.addPilotToCurrentHeat(data['pilotId'])
+        if(self.getOption(HEAT_LOCK_INPUT)):    
+            logging.info("pilot "+str(data['pilotId'])+" requested to be join the current heat")
+            self.addPilotToCurrentHeat(data['pilotId'])
+        else:
+            logging.info("pilot "+str(data['pilotId'])+" requested to be join the current heat but was denied")
 
     def handleSpectateRequest(self, data):
-        logging.info(data)
-        logging.info("pilot "+str(data['pilotId'])+" requested to be removed from the current heat")
-        self.removePilotFromCurrentHeat(data['pilotId'])
+        if(self.getOption(HEAT_LOCK_INPUT)):
+            logging.info(data)
+            logging.info("pilot "+str(data['pilotId'])+" requested to be removed from the current heat")
+            self.removePilotFromCurrentHeat(data['pilotId'])
+        else:
+            logging.info("pilot "+str(data['pilotId'])+" requested to be removed form the current heat but was denied")
 
     def getConnectedSeats(self):
         connectedSeats = []
@@ -317,6 +334,7 @@ class FSManager():
         self.rhapi.ui.socket_send("fs_join_success", {"pilotId":foundPilot.id, "seat":seat})
 
     def addPilotToCurrentHeat(self, pilotID):
+        logging.info("adding pilot to current heat: "+str(pilotID))
         #set the player in their slot if they are already in the heat
         currentHeatID = self.rhapi.race.heat
         slots = self.rhapi.db.slots_by_heat(currentHeatID)
@@ -420,6 +438,8 @@ class FSManager():
 
         #let's keep track of when this player was last updated
         self.flowStateMeta[seat]["lastUpdateTime"] = stateArrivalTime
+        steamID = self.rhapi.db.pilot_attribute_value(data["pilotId"], STEAM_ID, default_value=None)
+        self.flowStateMeta[seat]["steamId"] = steamID
 
         #handle tasks that need to run every time we get a client update
         self.handleAutoRun()
